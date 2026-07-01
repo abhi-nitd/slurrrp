@@ -1,0 +1,17 @@
+# Render Blueprint — deploys slurrrp as a free web service.
+# In Render: New > Blueprint > pick your slurrrp repo > Apply.
+services:
+  - type: web
+    name: slurrrp
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      # To make data permanent later: add a Disk (mounted at /data) on a paid
+      # instance, then set SLURRRP_DATA_DIR = /data
+      # - key: SLURRRP_DATA_DIR
+      #   value: /data

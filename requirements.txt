@@ -1,0 +1,2 @@
+# slurrrp has no third-party dependencies — it runs on the Python standard
+# library only. This file exists so hosting platforms detect a Python app.

@@ -1,0 +1,15 @@
+{
+  "name": "slurrrp — Cart & Kitchen",
+  "short_name": "slurrrp",
+  "description": "Take cart orders, relay them to the back kitchen, and track sales.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#1b18cc",
+  "theme_color": "#1b18cc",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "maskable" }
+  ]
+}
