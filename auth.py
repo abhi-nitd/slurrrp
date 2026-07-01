@@ -25,7 +25,14 @@ def _ensure_data_dir():
 
 
 def get_secret() -> bytes:
-    """Load the server signing secret, creating it on first run."""
+    """Load the server signing secret.
+
+    Prefers the SLURRRP_SECRET env var (set this on the host so login tokens
+    survive restarts/redeploys); otherwise creates a random one on first run.
+    """
+    env = os.environ.get("SLURRRP_SECRET")
+    if env:
+        return env.encode("utf-8")
     _ensure_data_dir()
     if not os.path.exists(SECRET_FILE):
         with open(SECRET_FILE, "w", encoding="utf-8") as fh:

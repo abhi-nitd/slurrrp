@@ -212,7 +212,21 @@
       if (S.user.role === "admin") loadReport().then(maybeRerender);
       maybeRerender();
     } else if (event === "menu:updated") {
-      api("/menu").then(function (d) { S.menu = d.items; if (S.view === "new-order") render(); });
+      var refreshViews = ["new-order", "menu", "stock", "dashboard"];
+      api("/menu").then(function (d) { S.menu = d.items; if (refreshViews.indexOf(S.view) >= 0) render(); });
+    } else if (event === "stock:update") {
+      (data.items || []).forEach(function (it) {
+        var m = S.menu.find(function (x) { return x.id === it.id; });
+        if (m) { m.stock = it.stock; m.low_stock = it.low_stock; }
+      });
+      if (["new-order", "kitchen", "stock", "menu", "dashboard"].indexOf(S.view) >= 0) render();
+    } else if (event === "stock:low") {
+      if (S.user.role === "kitchen" || S.user.role === "admin") {
+        beep();
+        var lowNames = (data.items || []).map(function (i) { return i.name + " (" + i.stock + " left)"; });
+        notify("Refill inventory", lowNames.join(", "));
+        toast("Refill needed: " + lowNames.join(", "), "err");
+      }
     }
   }
 
@@ -234,7 +248,20 @@
     });
     return t;
   }
-  function addToCart(id) { S.cart[id] = (S.cart[id] || 0) + 1; render(); }
+  function itemStock(id) {
+    var m = S.menu.find(function (x) { return String(x.id) === String(id); });
+    return m && m.stock !== null && m.stock !== undefined ? m.stock : null;
+  }
+  function addToCart(id) {
+    var stock = itemStock(id);
+    var have = S.cart[id] || 0;
+    if (stock !== null && have >= stock) {
+      toast(stock <= 0 ? "Sold out" : "Only " + stock + " left in stock", "err");
+      return;
+    }
+    S.cart[id] = have + 1;
+    render();
+  }
   function decCart(id) {
     if (!S.cart[id]) return;
     S.cart[id] -= 1;
@@ -301,7 +328,7 @@
     if (S.user.role === "seller")
       return [["new-order", "🛒", "New Order"], ["seller-orders", "🧾", "Orders"]];
     if (S.user.role === "kitchen")
-      return [["kitchen", "🍳", "Kitchen"], ["seller-orders", "📋", "All Orders"]];
+      return [["kitchen", "🍳", "Kitchen"], ["stock", "📦", "Stock"], ["seller-orders", "📋", "Orders"]];
     return [
       ["dashboard", "📊", "Dashboard"],
       ["admin-orders", "🧾", "Orders"],
@@ -342,6 +369,7 @@
       case "new-order": return renderNewOrder();
       case "seller-orders": return renderOrders(S.user.role === "kitchen");
       case "kitchen": return renderKitchen();
+      case "stock": return renderInventory(false);
       case "dashboard": return renderDashboard();
       case "admin-orders": return renderOrders(false, true);
       case "menu": return renderMenuAdmin();
@@ -398,18 +426,27 @@
   }
   function menuCard(m) {
     var q = S.cart[m.id] || 0;
+    var tracked = m.stock !== null && m.stock !== undefined;
+    var soldOut = tracked && m.stock <= 0;
+    var atMax = tracked && q >= m.stock;
+    var stockLine = tracked
+      ? '<div class="small ' + (m.stock <= m.low_stock ? "stock-low" : "muted") +
+        '" style="font-weight:600">' + (soldOut ? "Sold out" : m.stock + " left") + "</div>"
+      : "";
     var control = q
       ? '<div class="stepper"><button data-dec="' + m.id + '">−</button>' +
-        '<span class="q">' + q + '</span><button data-inc="' + m.id + '">+</button></div>'
-      : '<button class="add-btn" data-inc="' + m.id + '">+</button>';
+        '<span class="q">' + q + '</span>' +
+        '<button data-inc="' + m.id + '"' + (atMax ? " disabled" : "") + ">+</button></div>"
+      : (soldOut ? "" : '<button class="add-btn" data-inc="' + m.id + '">+</button>');
     return (
-      '<div class="mcard">' +
-      (q ? "" : "") +
+      '<div class="mcard' + (soldOut ? " mcard-out" : "") + '">' +
+      (soldOut && !q ? '<span class="soldout-tag">Sold out</span>' : "") +
       '<div class="mname">' + esc(m.name) + "</div>" +
       '<div>' + prepBadge(m.prep_location) + "</div>" +
+      stockLine +
       '<div class="between"><span class="mprice">' + money(m.price) + "</span>" +
       (q ? control : "") + "</div>" +
-      (q ? "" : '<button class="add-btn" data-inc="' + m.id + '">+</button>') +
+      (q ? "" : control) +
       "</div>"
     );
   }
@@ -490,14 +527,14 @@
     if (o.status === "new") {
       if (can("kitchen") && o.needs_kitchen) btns.push(btn("Start cooking", "btn-blue", "start", o.id));
       if (can("seller")) btns.push(btn("Mark served", "btn-ok", "served", o.id));
-      if (role === "seller" || role === "admin") btns.push(btn("Cancel", "btn-danger", "cancel", o.id));
     } else if (o.status === "preparing") {
       if (can("kitchen")) btns.push(btn("Mark ready", "btn-ok", "ready", o.id));
     } else if (o.status === "ready") {
       if (can("seller")) btns.push(btn("Mark served", "btn-ok", "served", o.id));
     }
-    if (admin && ["new", "preparing", "ready"].indexOf(o.status) >= 0 && o.status !== "new")
-      btns.push(btn("Cancel", "btn-danger", "cancel", o.id));
+    // Voiding an order is admin-only (a seller must not be able to erase a sale).
+    if (role === "admin" && ["new", "preparing", "ready"].indexOf(o.status) >= 0)
+      btns.push(btn("Void order", "btn-danger", "cancel", o.id));
     return btns.join("");
   }
   function btn(label, cls, action, id) {
@@ -542,6 +579,40 @@
     );
   }
 
+  /* ---------- inventory (kitchen read-only; admin manages in Menu) ---------- */
+  function renderInventory(canManage) {
+    var tracked = S.menu.filter(function (m) {
+      return m.is_active && m.stock !== null && m.stock !== undefined;
+    });
+    var low = tracked.filter(function (m) { return m.stock <= m.low_stock; });
+    var head = viewTitle("Inventory", tracked.length + " tracked · " + low.length + " need refill");
+    if (!tracked.length)
+      return head + emptyState("📦", "Nothing tracked yet", "Admin can set stock counts in the Menu tab.");
+    var lowBanner = low.length
+      ? '<div class="card" style="border-left:5px solid var(--red)"><b style="color:var(--red-dark)">⚠ Refill needed</b>' +
+        '<div class="small" style="margin-top:4px">' +
+        low.map(function (m) { return esc(m.name) + " (" + m.stock + " left)"; }).join(", ") + "</div></div>"
+      : '<div class="card" style="border-left:5px solid var(--ok)"><b style="color:var(--ok)">✓ Stock levels healthy</b></div>';
+    tracked = tracked.slice().sort(function (a, b) {
+      return (a.stock - a.low_stock) - (b.stock - b.low_stock);
+    });
+    var rows = tracked.map(function (m) { return invRow(m, canManage); }).join("");
+    return head + lowBanner + '<div class="card">' + rows + "</div>";
+  }
+  function invRow(m, canManage) {
+    var isLow = m.stock <= m.low_stock;
+    return (
+      '<div class="list-row">' +
+      '<div class="grow"><div style="font-weight:600">' + esc(m.name) + " " + prepBadge(m.prep_location) + "</div>" +
+      '<div class="small ' + (isLow ? "stock-low" : "muted") + '" style="font-weight:600">' +
+      m.stock + " left" + (isLow ? " · alert at " + m.low_stock : "") + "</div></div>" +
+      (canManage
+        ? '<button class="btn btn-sm btn-outline" data-restock="' + m.id + '">Restock</button>'
+        : (isLow ? '<span class="pill pill-cancelled">LOW</span>' : "")) +
+      "</div>"
+    );
+  }
+
   /* ---------- admin dashboard ---------- */
   function renderDashboard() {
     var r = S.report;
@@ -564,6 +635,13 @@
       payTile("Cash", r.by_payment.cash) + payTile("UPI", r.by_payment.upi) + payTile("Card", r.by_payment.card) +
       "</div>" +
       (r.by_payment.unset ? '<div class="fab-note">' + money(r.by_payment.unset) + " marked unpaid</div>" : "") +
+      ((r.low_stock && r.low_stock.length)
+        ? '<div class="cat-head">Refill needed</div><div class="card" style="border-left:5px solid var(--red)">' +
+          r.low_stock.map(function (m) {
+            return '<div class="between" style="padding:5px 0"><span>' + esc(m.name) +
+              '</span><span class="stock-low" style="font-weight:800">' + m.stock + " left</span></div>";
+          }).join("") + "</div>"
+        : "") +
       '<div class="cat-head">Live orders</div>' +
       renderActiveMini() +
       '<div class="cat-head">Top sellers</div><div class="card">' + top + "</div>"
@@ -594,6 +672,9 @@
       '<div class="field"><label>Prepared at</label><div class="pay-opts">' +
       '<button data-prep="cart" class="' + (prepSel() === "cart" ? "active" : "") + '">🛒 Cart</button>' +
       '<button data-prep="kitchen" class="' + (prepSel() === "kitchen" ? "active" : "") + '">🍳 Back kitchen</button></div></div>' +
+      '<div class="row"><div class="field grow"><label>Starting stock <span class="muted">(blank = don\'t track)</span></label>' +
+      '<input id="mi-stock" type="number" inputmode="numeric" value="' + (e && e.stock !== null && e.stock !== undefined ? e.stock : "") + '" placeholder="e.g. 40"></div>' +
+      '<div class="field" style="width:120px"><label>Alert at</label><input id="mi-low" type="number" inputmode="numeric" value="' + (e ? e.low_stock : 10) + '"></div></div>' +
       '<div class="row" style="gap:8px">' +
       '<button class="btn btn-primary grow" data-act="save-menu">' + (e ? "Save changes" : "Add item") + "</button>" +
       (e ? '<button class="btn btn-outline" data-act="cancel-edit">Cancel</button>' : "") +
@@ -608,10 +689,18 @@
   }
   function prepSel() { return S.editItem ? S.editItem.prep_location : (S._newPrep || "cart"); }
   function menuAdminRow(m) {
+    var tracked = m.stock !== null && m.stock !== undefined;
+    var isLow = tracked && m.stock <= m.low_stock;
+    var sub = money(m.price) +
+      (tracked
+        ? ' · <span class="' + (isLow ? "stock-low" : "muted") + '" style="font-weight:600">' + m.stock + " in stock</span>"
+        : ' · <span class="muted">stock not tracked</span>') +
+      (m.is_active ? "" : ' · <span class="muted">hidden</span>');
     return (
       '<div class="list-row ' + (m.is_active ? "" : "inactive") + '">' +
-      '<div class="grow"><div style="font-weight:600">' + esc(m.name) + " " + prepBadge(m.prep_location) + "</div>" +
-      '<div class="small muted">' + money(m.price) + (m.is_active ? "" : " · hidden") + "</div></div>" +
+      '<div class="grow" style="min-width:130px"><div style="font-weight:600">' + esc(m.name) + " " + prepBadge(m.prep_location) + "</div>" +
+      '<div class="small">' + sub + "</div></div>" +
+      (tracked ? '<button class="btn btn-sm btn-blue" data-restock="' + m.id + '">Stock</button>' : "") +
       '<button class="btn btn-sm btn-outline" data-edit="' + m.id + '">Edit</button>' +
       '<button class="btn btn-sm btn-danger" data-del="' + m.id + '">Remove</button>' +
       "</div>"
@@ -687,7 +776,7 @@
   }
 
   function onClick(ev) {
-    var t = ev.target.closest("[data-act],[data-inc],[data-dec],[data-cat],[data-pay],[data-order],[data-nav],[data-edit],[data-del],[data-prep],[data-deluser],[data-resetpw]");
+    var t = ev.target.closest("[data-act],[data-inc],[data-dec],[data-cat],[data-pay],[data-order],[data-nav],[data-edit],[data-del],[data-prep],[data-deluser],[data-resetpw],[data-restock]");
     if (!t) return;
     var a;
     if ((a = t.getAttribute("data-inc"))) return addToCart(a);
@@ -712,6 +801,7 @@
       window.scrollTo(0, 0); return render();
     }
     if ((a = t.getAttribute("data-del"))) return removeMenu(a);
+    if ((a = t.getAttribute("data-restock"))) return restock(a);
     if ((a = t.getAttribute("data-deluser"))) return removeUser(a);
     if ((a = t.getAttribute("data-resetpw"))) return resetPw(a);
 
@@ -739,7 +829,13 @@
     var prep = prepSel();
     if (!name) return toast("Enter an item name", "err");
     if (isNaN(price) || price < 0) return toast("Enter a valid price", "err");
-    var body = { name: name, category: cat, price: price, prep_location: prep };
+    var stockRaw = document.querySelector("#mi-stock").value.trim();
+    var lowRaw = document.querySelector("#mi-low").value.trim();
+    var body = {
+      name: name, category: cat, price: price, prep_location: prep,
+      stock: stockRaw === "" ? "" : stockRaw,        // "" => not tracked
+      low_stock: lowRaw === "" ? 10 : lowRaw,
+    };
     var req = S.editItem
       ? api("/menu/" + S.editItem.id, { method: "PUT", body: body })
       : api("/menu", { method: "POST", body: body });
@@ -747,6 +843,28 @@
       S.editItem = null; S._newPrep = "cart";
       return api("/menu").then(function (d) { S.menu = d.items; });
     }).then(function () { toast("Menu saved", "ok"); render(); })
+      .catch(function (e) { toast(e.message, "err"); });
+  }
+  function restock(id) {
+    var m = S.menu.find(function (x) { return String(x.id) === String(id); });
+    if (!m) return;
+    var cur = (m.stock === null || m.stock === undefined) ? 0 : m.stock;
+    var input = prompt("Restock " + m.name + " — current: " + cur +
+      "\nEnter how many to ADD (e.g. 20), or =50 to set the total:", "");
+    if (input === null) return;
+    input = input.trim();
+    if (input === "") return;
+    var body;
+    if (input.charAt(0) === "=") {
+      body = { stock: input.slice(1).trim() };
+    } else {
+      var n = parseInt(input, 10);
+      if (isNaN(n)) return toast("Enter a number", "err");
+      body = { add: n };
+    }
+    api("/menu/" + id + "/stock", { method: "POST", body: body })
+      .then(function () { return api("/menu"); })
+      .then(function (d) { S.menu = d.items; toast("Stock updated", "ok"); render(); })
       .catch(function (e) { toast(e.message, "err"); });
   }
   function removeMenu(id) {

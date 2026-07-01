@@ -24,6 +24,15 @@ import events
 HERE = os.path.dirname(os.path.abspath(__file__))
 PUBLIC_DIR = os.path.join(HERE, "public")
 
+# Content Security Policy for the app shell. Everything is same-origin; inline
+# scripts are disallowed (blocks injected XSS), inline styles are allowed for the
+# app's style="" attributes, and the page can't be embedded in a frame.
+CSP = (
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; font-src 'self'; connect-src 'self'; manifest-src 'self'; "
+    "worker-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+)
+
 mimetypes.add_type("application/manifest+json", ".webmanifest")
 mimetypes.add_type("text/javascript", ".js")
 mimetypes.add_type("image/svg+xml", ".svg")
@@ -37,6 +46,8 @@ ROUTES = [
     ("POST", r"^/api/menu$", api.create_menu),
     ("PUT", r"^/api/menu/(?P<id>\d+)$", api.update_menu),
     ("DELETE", r"^/api/menu/(?P<id>\d+)$", api.delete_menu),
+    ("POST", r"^/api/menu/(?P<id>\d+)/stock$", api.set_stock),
+    ("GET", r"^/api/inventory$", api.inventory),
     ("GET", r"^/api/orders$", api.list_orders),
     ("POST", r"^/api/orders$", api.create_order),
     ("GET", r"^/api/orders/(?P<id>\d+)$", api.get_order),
@@ -77,17 +88,21 @@ class Handler(BaseHTTPRequestHandler):
         sys.stdout.write("%s - %s\n" % (self.address_string(), fmt % args))
 
     # ---- helpers ----
-    def _cors(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+    def _sec_headers(self):
+        # Same-origin app: no wildcard CORS (other sites can't call the API in a
+        # browser). Plus standard hardening headers.
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 
     def _json(self, status, obj):
         body = json.dumps(obj).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self._cors()
+        self.send_header("Cache-Control", "no-store")
+        self._sec_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -113,7 +128,7 @@ class Handler(BaseHTTPRequestHandler):
     # ---- verb dispatch ----
     def do_OPTIONS(self):
         self.send_response(204)
-        self._cors()
+        self._sec_headers()
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -149,11 +164,14 @@ class Handler(BaseHTTPRequestHandler):
             if not match:
                 continue
             body = self._read_body() if method in ("POST", "PUT", "PATCH", "DELETE") else {}
+            xff = self.headers.get("X-Forwarded-For", "")
+            ip = xff.split(",")[0].strip() if xff else self.client_address[0]
             ctx = {
                 "user": self._user_from_auth(),
                 "params": match.groupdict(),
                 "query": query,
                 "body": body,
+                "ip": ip,
             }
             try:
                 result = handler(ctx)
@@ -177,7 +195,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "close")
-            self._cors()
+            self._sec_headers()
             self.end_headers()
             self.wfile.write(b": connected\n\n")
             self.wfile.flush()
@@ -213,10 +231,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        if ctype.startswith("text/html"):
+            self.send_header("Content-Security-Policy", CSP)
         if os.path.basename(target) == "sw.js":
             self.send_header("Service-Worker-Allowed", "/")
             self.send_header("Cache-Control", "no-cache")
-        self._cors()
+        self._sec_headers()
         self.end_headers()
         self.wfile.write(data)
 

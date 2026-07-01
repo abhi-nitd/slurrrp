@@ -68,6 +68,8 @@ CREATE TABLE IF NOT EXISTS menu_items (
     prep_location TEXT NOT NULL CHECK(prep_location IN ('cart','kitchen')) DEFAULT 'cart',
     is_active     INTEGER NOT NULL DEFAULT 1,
     sort_order    INTEGER NOT NULL DEFAULT 0,
+    stock         INTEGER,                       -- NULL = not tracked (made to order)
+    low_stock     INTEGER NOT NULL DEFAULT 10,   -- refill alert threshold
     created_at    TEXT NOT NULL
 );
 
@@ -109,27 +111,33 @@ SEED_USERS = [
     ("Cart Seller", "seller", "slurrrp123", "seller"),
 ]
 
-# (name, category, price, prep_location)
+# (name, category, price, prep_location, stock)  — stock None = not tracked
 SEED_MENU = [
-    ("Veg Momos (Steamed)", "Momos", 80, "cart"),
-    ("Chicken Momos (Steamed)", "Momos", 110, "cart"),
-    ("Veg Spring Rolls", "Starters", 90, "cart"),
-    ("Prawn Crackers", "Starters", 60, "cart"),
-    ("Edamame (Salted)", "Starters", 100, "cart"),
-    ("Bubble Tea (Classic)", "Beverages", 120, "cart"),
-    ("Thai Iced Tea", "Beverages", 90, "cart"),
-    ("Fresh Lime Soda", "Beverages", 50, "cart"),
-    ("Veg Hakka Noodles", "Noodles", 140, "kitchen"),
-    ("Chicken Hakka Noodles", "Noodles", 170, "kitchen"),
-    ("Veg Pad Thai", "Noodles", 180, "kitchen"),
-    ("Veg Fried Rice", "Rice", 130, "kitchen"),
-    ("Chicken Fried Rice", "Rice", 160, "kitchen"),
-    ("Chicken Ramen Bowl", "Ramen", 220, "kitchen"),
-    ("Chilli Chicken (Dry)", "Mains", 200, "kitchen"),
-    ("Veg Manchurian", "Mains", 160, "kitchen"),
-    ("Thai Green Curry + Rice", "Mains", 210, "kitchen"),
-    ("Dim Sum Platter", "Momos", 190, "kitchen"),
+    ("Veg Momos (Steamed)", "Momos", 80, "cart", 40),
+    ("Chicken Momos (Steamed)", "Momos", 110, "cart", 40),
+    ("Veg Spring Rolls", "Starters", 90, "cart", 30),
+    ("Prawn Crackers", "Starters", 60, "cart", 25),
+    ("Edamame (Salted)", "Starters", 100, "cart", 20),
+    ("Bubble Tea (Classic)", "Beverages", 120, "cart", 30),
+    ("Thai Iced Tea", "Beverages", 90, "cart", 30),
+    ("Fresh Lime Soda", "Beverages", 50, "cart", 40),
+    ("Veg Hakka Noodles", "Noodles", 140, "kitchen", None),
+    ("Chicken Hakka Noodles", "Noodles", 170, "kitchen", None),
+    ("Veg Pad Thai", "Noodles", 180, "kitchen", None),
+    ("Veg Fried Rice", "Rice", 130, "kitchen", None),
+    ("Chicken Fried Rice", "Rice", 160, "kitchen", None),
+    ("Chicken Ramen Bowl", "Ramen", 220, "kitchen", None),
+    ("Chilli Chicken (Dry)", "Mains", 200, "kitchen", None),
+    ("Veg Manchurian", "Mains", 160, "kitchen", None),
+    ("Thai Green Curry + Rice", "Mains", 210, "kitchen", None),
+    ("Dim Sum Platter", "Momos", 190, "kitchen", None),
 ]
+
+
+def _ensure_column(table, col, decl):
+    cols = [r["name"] for r in query(f"PRAGMA table_info({table})")]
+    if col not in cols:
+        execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
 
 def init_db():
@@ -137,6 +145,9 @@ def init_db():
     with _lock:
         conn.executescript(SCHEMA)
         conn.commit()
+    # migrations for databases created before inventory existed
+    _ensure_column("menu_items", "stock", "INTEGER")
+    _ensure_column("menu_items", "low_stock", "INTEGER NOT NULL DEFAULT 10")
     now = datetime.now().isoformat(timespec="seconds")
 
     if not query_one("SELECT id FROM users LIMIT 1"):
@@ -148,9 +159,9 @@ def init_db():
             )
 
     if not query_one("SELECT id FROM menu_items LIMIT 1"):
-        for i, (name, cat, price, prep) in enumerate(SEED_MENU):
+        for i, (name, cat, price, prep, stock) in enumerate(SEED_MENU):
             execute(
                 "INSERT INTO menu_items (name, category, price, prep_location,"
-                " sort_order, created_at) VALUES (?,?,?,?,?,?)",
-                (name, cat, price, prep, i, now),
+                " sort_order, stock, created_at) VALUES (?,?,?,?,?,?,?)",
+                (name, cat, price, prep, i, stock, now),
             )

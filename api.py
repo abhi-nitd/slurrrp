@@ -3,6 +3,8 @@
 Each handler receives a `ctx` dict with: user, params, body, query.
 Handlers return a JSON-serialisable value, or raise ApiError.
 """
+import threading
+import time
 from datetime import datetime
 
 import auth
@@ -15,6 +17,32 @@ class ApiError(Exception):
         super().__init__(message)
         self.status = status
         self.message = message
+
+
+# ---- login rate limiting (blunts password guessing on the public login) ----
+_LOGIN_WINDOW = 600      # seconds
+_LOGIN_MAX_FAILS = 10    # per IP within the window
+_attempts = {}
+_attempts_lock = threading.Lock()
+
+
+def _rate_check(ip):
+    now = time.time()
+    with _attempts_lock:
+        arr = [t for t in _attempts.get(ip, []) if now - t < _LOGIN_WINDOW]
+        _attempts[ip] = arr
+        if len(arr) >= _LOGIN_MAX_FAILS:
+            raise ApiError(429, "Too many login attempts. Please wait a few minutes.")
+
+
+def _rate_fail(ip):
+    with _attempts_lock:
+        _attempts.setdefault(ip, []).append(time.time())
+
+
+def _rate_clear(ip):
+    with _attempts_lock:
+        _attempts.pop(ip, None)
 
 
 def _today():
@@ -41,15 +69,48 @@ def _num(v, field):
         raise ApiError(400, f"{field} must be a number.")
 
 
+def _parse_stock(v):
+    """None/blank => untracked. Otherwise a non-negative integer count."""
+    if v is None or v == "":
+        return None
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        raise ApiError(400, "Stock must be a whole number.")
+    if n < 0:
+        raise ApiError(400, "Stock can't be negative.")
+    return n
+
+
+def _emit_stock(item_ids):
+    """Broadcast updated stock for the given items, and a low-stock alert."""
+    ids = [i for i in set(item_ids) if i is not None]
+    if not ids:
+        return
+    ph = ",".join("?" * len(ids))
+    items = db.query(
+        f"SELECT id, name, stock, low_stock, prep_location FROM menu_items WHERE id IN ({ph})",
+        tuple(ids),
+    )
+    events.publish(["seller", "kitchen", "admin"], "stock:update", {"items": items})
+    low = [i for i in items if i["stock"] is not None and i["stock"] <= i["low_stock"]]
+    if low:
+        events.publish(["kitchen", "admin"], "stock:low", {"items": low})
+
+
 # ---- auth ------------------------------------------------------------------
 
 def login(ctx):
     body = ctx["body"]
+    ip = ctx.get("ip") or "?"
+    _rate_check(ip)
     username = (body.get("username") or "").strip().lower()
     password = body.get("password") or ""
     row = db.query_one("SELECT * FROM users WHERE username=? AND is_active=1", (username,))
     if not row or not auth.verify_password(password, row["password_hash"]):
+        _rate_fail(ip)
         raise ApiError(401, "Wrong username or password.")
+    _rate_clear(ip)
     user = {"id": row["id"], "name": row["name"], "username": row["username"], "role": row["role"]}
     token = auth.make_token(user)
     return {"token": token, "user": user}
@@ -85,10 +146,12 @@ def create_menu(ctx):
     prep = b.get("prep_location", "cart")
     if prep not in ("cart", "kitchen"):
         raise ApiError(400, "prep_location must be 'cart' or 'kitchen'.")
+    stock = _parse_stock(b.get("stock"))
+    low_stock = int(_num(b.get("low_stock"), "Low-stock alert")) if b.get("low_stock") not in (None, "") else 10
     mid = db.execute(
-        "INSERT INTO menu_items (name, category, price, prep_location, created_at)"
-        " VALUES (?,?,?,?,?)",
-        (name, category, price, prep, _now()),
+        "INSERT INTO menu_items (name, category, price, prep_location, stock, low_stock, created_at)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (name, category, price, prep, stock, low_stock, _now()),
     )
     item = db.query_one("SELECT * FROM menu_items WHERE id=?", (mid,))
     events.publish(["seller", "kitchen", "admin"], "menu:updated", {})
@@ -109,12 +172,15 @@ def update_menu(ctx):
     if prep not in ("cart", "kitchen"):
         raise ApiError(400, "prep_location must be 'cart' or 'kitchen'.")
     is_active = int(bool(b["is_active"])) if "is_active" in b else item["is_active"]
+    stock = _parse_stock(b["stock"]) if "stock" in b else item["stock"]
+    low_stock = int(_num(b["low_stock"], "Low-stock alert")) if b.get("low_stock") not in (None, "") else item["low_stock"]
     db.execute(
-        "UPDATE menu_items SET name=?, category=?, price=?, prep_location=?, is_active=?"
-        " WHERE id=?",
-        (name, category, price, prep, is_active, mid),
+        "UPDATE menu_items SET name=?, category=?, price=?, prep_location=?, is_active=?,"
+        " stock=?, low_stock=? WHERE id=?",
+        (name, category, price, prep, is_active, stock, low_stock, mid),
     )
     events.publish(["seller", "kitchen", "admin"], "menu:updated", {})
+    _emit_stock([mid])
     return {"item": db.query_one("SELECT * FROM menu_items WHERE id=?", (mid,))}
 
 
@@ -202,38 +268,61 @@ def create_order(ctx):
 
     lock, conn = db.transaction()
     with lock:
-        row = conn.execute(
-            "SELECT COALESCE(MAX(token_number),0)+1 AS t FROM orders WHERE order_date=?",
-            (date,),
-        ).fetchone()
-        token = row["t"]
-        cur = conn.execute(
-            "INSERT INTO orders (token_number, order_date, status, payment_mode,"
-            " needs_kitchen, subtotal, total, note, created_by, created_by_name,"
-            " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (token, date, "new", payment_mode, int(needs_kitchen), subtotal, total,
-             note, user["id"], user["name"], now, now),
-        )
-        oid = cur.lastrowid
-        for mi, qty, line_total in resolved:
-            conn.execute(
-                "INSERT INTO order_items (order_id, menu_item_id, name, price, qty,"
-                " prep_location, line_total) VALUES (?,?,?,?,?,?,?)",
-                (oid, mi["id"], mi["name"], mi["price"], qty, mi["prep_location"], line_total),
+        try:
+            # Block overselling: re-check tracked stock against live counts.
+            for mi, qty, _ in resolved:
+                if mi["stock"] is not None:
+                    cur_stock = conn.execute(
+                        "SELECT stock FROM menu_items WHERE id=?", (mi["id"],)
+                    ).fetchone()["stock"]
+                    if cur_stock is not None and qty > cur_stock:
+                        raise ApiError(
+                            409,
+                            f"Only {cur_stock} left of {mi['name']}. Please adjust the order.",
+                        )
+            row = conn.execute(
+                "SELECT COALESCE(MAX(token_number),0)+1 AS t FROM orders WHERE order_date=?",
+                (date,),
+            ).fetchone()
+            token = row["t"]
+            cur = conn.execute(
+                "INSERT INTO orders (token_number, order_date, status, payment_mode,"
+                " needs_kitchen, subtotal, total, note, created_by, created_by_name,"
+                " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (token, date, "new", payment_mode, int(needs_kitchen), subtotal, total,
+                 note, user["id"], user["name"], now, now),
             )
-        conn.commit()
+            oid = cur.lastrowid
+            for mi, qty, line_total in resolved:
+                conn.execute(
+                    "INSERT INTO order_items (order_id, menu_item_id, name, price, qty,"
+                    " prep_location, line_total) VALUES (?,?,?,?,?,?,?)",
+                    (oid, mi["id"], mi["name"], mi["price"], qty, mi["prep_location"], line_total),
+                )
+                # draw down tracked inventory
+                conn.execute(
+                    "UPDATE menu_items SET stock = stock - ? WHERE id=? AND stock IS NOT NULL",
+                    (qty, mi["id"]),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
     order = _order_dict(db.query_one("SELECT * FROM orders WHERE id=?", (oid,)))
     # Relay to kitchen + admin (new order) and back to sellers (list refresh).
     events.publish(["kitchen", "admin", "seller"], "order:new", order)
+    _emit_stock([mi["id"] for mi, _, _ in resolved])  # live stock + low-stock alerts
     return {"order": order}
 
 
-# status transitions and who may trigger them
+# Status transitions and who may trigger them. Voiding/cancelling an order is
+# ADMIN-ONLY on purpose: a seller must not be able to make a recorded sale (and
+# its cash) disappear.
 _TRANSITIONS = {
     "new": {"preparing": ("kitchen", "admin"),
             "served": ("seller", "admin"),
-            "cancelled": ("seller", "admin")},
+            "cancelled": ("admin",)},
     "preparing": {"ready": ("kitchen", "admin"),
                   "cancelled": ("admin",)},
     "ready": {"served": ("seller", "admin"),
@@ -255,12 +344,59 @@ def update_status(ctx):
         raise ApiError(400, f"Can't move an order from {order['status']} to {new_status}.")
     if user["role"] not in allowed[new_status]:
         raise ApiError(403, "You don't have access to this action.")
-    db.execute(
-        "UPDATE orders SET status=?, updated_at=? WHERE id=?", (new_status, _now(), oid)
-    )
+
+    restock_ids = []
+    lock, conn = db.transaction()
+    with lock:
+        try:
+            conn.execute(
+                "UPDATE orders SET status=?, updated_at=? WHERE id=?",
+                (new_status, _now(), oid),
+            )
+            if new_status == "cancelled":
+                # put the items back into inventory
+                for it in db.query("SELECT menu_item_id, qty FROM order_items WHERE order_id=?", (oid,)):
+                    if it["menu_item_id"] is not None:
+                        conn.execute(
+                            "UPDATE menu_items SET stock = stock + ? WHERE id=? AND stock IS NOT NULL",
+                            (it["qty"], it["menu_item_id"]),
+                        )
+                        restock_ids.append(it["menu_item_id"])
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
     updated = _order_dict(db.query_one("SELECT * FROM orders WHERE id=?", (oid,)))
     events.publish(["kitchen", "admin", "seller"], "order:status", updated)
+    if restock_ids:
+        _emit_stock(restock_ids)
     return {"order": updated}
+
+
+def set_stock(ctx):
+    """Admin restock: set an absolute count, add to it, or update the threshold."""
+    _require(ctx, "admin")
+    mid = ctx["params"]["id"]
+    item = db.query_one("SELECT * FROM menu_items WHERE id=?", (mid,))
+    if not item:
+        raise ApiError(404, "Menu item not found.")
+    b = ctx["body"]
+    if "add" in b:
+        base = item["stock"] or 0
+        new_stock = base + int(_num(b["add"], "Amount"))
+        if new_stock < 0:
+            new_stock = 0
+    elif "stock" in b:
+        new_stock = _parse_stock(b["stock"])
+    else:
+        new_stock = item["stock"]
+    low_stock = item["low_stock"]
+    if b.get("low_stock") not in (None, ""):
+        low_stock = int(_num(b["low_stock"], "Low-stock alert"))
+    db.execute("UPDATE menu_items SET stock=?, low_stock=? WHERE id=?", (new_stock, low_stock, mid))
+    _emit_stock([int(mid)])
+    return {"item": db.query_one("SELECT * FROM menu_items WHERE id=?", (mid,))}
 
 
 # ---- users -----------------------------------------------------------------
@@ -366,6 +502,11 @@ def report_summary(ctx):
     )
     count = total_row["c"] or 0
     gross = round(total_row["g"] or 0, 2)
+    inventory = db.query(
+        "SELECT id, name, category, stock, low_stock, prep_location FROM menu_items"
+        " WHERE is_active=1 AND stock IS NOT NULL ORDER BY stock ASC, category, name"
+    )
+    low_stock = [i for i in inventory if i["stock"] <= i["low_stock"]]
     return {
         "date": date,
         "order_count": count,
@@ -374,8 +515,20 @@ def report_summary(ctx):
         "by_payment": by_payment,
         "by_status": by_status,
         "top_items": top,
+        "inventory": inventory,
+        "low_stock": low_stock,
     }
 
 
+def inventory(ctx):
+    """Tracked-stock list — visible to seller/kitchen/admin."""
+    _require(ctx)
+    rows = db.query(
+        "SELECT id, name, category, stock, low_stock, prep_location FROM menu_items"
+        " WHERE is_active=1 AND stock IS NOT NULL ORDER BY stock ASC, category, name"
+    )
+    return {"items": rows, "low": [r for r in rows if r["stock"] <= r["low_stock"]]}
+
+
 def health(ctx):
-    return {"ok": True, "connections": events.connection_count()}
+    return {"ok": True}
