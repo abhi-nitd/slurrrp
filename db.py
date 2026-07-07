@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT NOT NULL,
     role          TEXT NOT NULL CHECK(role IN ('admin','kitchen','seller')),
     is_active     INTEGER NOT NULL DEFAULT 1,
+    token_epoch   INTEGER NOT NULL DEFAULT 0,  -- bumped on password reset => old logins die
     created_at    TEXT NOT NULL
 );
 
@@ -101,8 +102,17 @@ CREATE TABLE IF NOT EXISTS order_items (
     line_total    REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS order_log (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id  INTEGER NOT NULL,
+    action    TEXT NOT NULL,
+    by_name   TEXT,
+    at        TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_orders_date ON orders(order_date);
 CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id);
+CREATE INDEX IF NOT EXISTS idx_order_log_order ON order_log(order_id);
 """
 
 SEED_USERS = [
@@ -145,9 +155,10 @@ def init_db():
     with _lock:
         conn.executescript(SCHEMA)
         conn.commit()
-    # migrations for databases created before inventory existed
+    # migrations for databases created before inventory / session-epoch existed
     _ensure_column("menu_items", "stock", "INTEGER")
     _ensure_column("menu_items", "low_stock", "INTEGER NOT NULL DEFAULT 10")
+    _ensure_column("users", "token_epoch", "INTEGER NOT NULL DEFAULT 0")
     now = datetime.now().isoformat(timespec="seconds")
 
     if not query_one("SELECT id FROM users LIMIT 1"):

@@ -8,11 +8,14 @@ import threading
 _lock = threading.Lock()
 _subscribers = {}  # client_id -> {"role": str, "q": Queue}
 _counter = 0
+MAX_SUBSCRIBERS = 300  # each stream holds a thread; cap so floods can't exhaust us
 
 
 def subscribe(role: str):
     global _counter
     with _lock:
+        if len(_subscribers) >= MAX_SUBSCRIBERS:
+            return None, None
         _counter += 1
         cid = _counter
         q = queue.Queue(maxsize=100)

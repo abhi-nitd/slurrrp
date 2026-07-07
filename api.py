@@ -3,13 +3,26 @@
 Each handler receives a `ctx` dict with: user, params, body, query.
 Handlers return a JSON-serialisable value, or raise ApiError.
 """
+import os
+import re
+import secrets
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import auth
 import db
 import events
+
+# Business timezone: the sales "day" (token numbers, reports) follows this, not
+# the server's clock (cloud hosts run UTC). Override with SLURRRP_TZ if needed.
+try:
+    from zoneinfo import ZoneInfo
+    _TZ = ZoneInfo(os.environ.get("SLURRRP_TZ", "Asia/Kolkata"))
+except Exception:  # Windows without tzdata — fixed IST offset fallback
+    _TZ = timezone(timedelta(hours=5, minutes=30))
+
+_DATE_RX = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 class ApiError(Exception):
@@ -45,18 +58,69 @@ def _rate_clear(ip):
         _attempts.pop(ip, None)
 
 
+# ---- one-time tickets for the live-updates stream ---------------------------
+# EventSource can't send an Authorization header, and putting the real login
+# token in the URL would leak it into proxy/server logs. Instead the client
+# swaps its token for a single-use 60-second ticket.
+_TICKET_TTL = 60
+_tickets = {}
+_tickets_lock = threading.Lock()
+
+
+def issue_ticket(payload):
+    now = time.time()
+    with _tickets_lock:
+        for k in [k for k, v in _tickets.items() if v[1] < now]:
+            _tickets.pop(k, None)
+        t = secrets.token_urlsafe(24)
+        _tickets[t] = (payload, now + _TICKET_TTL)
+    return t
+
+
+def consume_ticket(t):
+    with _tickets_lock:
+        v = _tickets.pop(t, None)
+    if not v or v[1] < time.time():
+        return None
+    return v[0]
+
+
 def _today():
-    return datetime.now().strftime("%Y-%m-%d")
+    return datetime.now(_TZ).strftime("%Y-%m-%d")
 
 
 def _now():
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now(_TZ).isoformat(timespec="seconds")
+
+
+def _check_date(d):
+    if not _DATE_RX.match(d or ""):
+        raise ApiError(400, "Date must be YYYY-MM-DD.")
+    return d
+
+
+def validate_session(payload):
+    """Re-check a token against the database on every request. This is what
+    makes 'remove staff' and 'reset password' take effect immediately instead
+    of whenever the old token happens to expire."""
+    if not payload or "id" not in payload:
+        return None
+    row = db.query_one(
+        "SELECT id, name, username, role, is_active, token_epoch FROM users WHERE id=?",
+        (payload["id"],),
+    )
+    if not row or not row["is_active"]:
+        return None
+    if int(payload.get("epoch", 0)) != int(row["token_epoch"] or 0):
+        return None
+    return {"id": row["id"], "name": row["name"], "username": row["username"],
+            "role": row["role"], "epoch": row["token_epoch"] or 0}
 
 
 def _require(ctx, *roles):
-    user = ctx.get("user")
+    user = validate_session(ctx.get("user"))
     if not user:
-        raise ApiError(401, "Please log in.")
+        raise ApiError(401, "Please log in again.")
     if roles and user["role"] not in roles:
         raise ApiError(403, "You don't have access to this action.")
     return user
@@ -100,25 +164,44 @@ def _emit_stock(item_ids):
 
 # ---- auth ------------------------------------------------------------------
 
+# Used when the username doesn't exist, so a wrong-user and a wrong-password
+# attempt take the same time (prevents guessing which usernames are real).
+_DUMMY_HASH = auth.hash_password(secrets.token_hex(8))
+
+
 def login(ctx):
     body = ctx["body"]
     ip = ctx.get("ip") or "?"
-    _rate_check(ip)
     username = (body.get("username") or "").strip().lower()
+    # Rate-limit by connecting address AND by username, so neither header
+    # spoofing nor rotating addresses lets someone hammer one account.
+    _rate_check(ip)
+    _rate_check("u:" + username)
     password = body.get("password") or ""
     row = db.query_one("SELECT * FROM users WHERE username=? AND is_active=1", (username,))
-    if not row or not auth.verify_password(password, row["password_hash"]):
+    ok = auth.verify_password(password, row["password_hash"] if row else _DUMMY_HASH)
+    if not row or not ok:
         _rate_fail(ip)
+        _rate_fail("u:" + username)
         raise ApiError(401, "Wrong username or password.")
     _rate_clear(ip)
+    _rate_clear("u:" + username)
     user = {"id": row["id"], "name": row["name"], "username": row["username"], "role": row["role"]}
-    token = auth.make_token(user)
+    token = auth.make_token({"id": row["id"], "epoch": row["token_epoch"] or 0})
     return {"token": token, "user": user}
 
 
 def me(ctx):
     user = _require(ctx)
-    return {"user": user}
+    return {"user": {"id": user["id"], "name": user["name"],
+                     "username": user["username"], "role": user["role"]}}
+
+
+def events_ticket(ctx):
+    """Swap a valid login for a one-time ticket to open the live stream."""
+    user = _require(ctx)
+    return {"ticket": issue_ticket({"id": user["id"], "epoch": user["epoch"]}),
+            "expires_in": _TICKET_TTL}
 
 
 # ---- menu ------------------------------------------------------------------
@@ -204,13 +287,17 @@ def _order_dict(order):
     )
     out = dict(order)
     out["items"] = items
+    out["log"] = db.query(
+        "SELECT action, by_name, at FROM order_log WHERE order_id=? ORDER BY id",
+        (order["id"],),
+    )
     return out
 
 
 def list_orders(ctx):
     user = _require(ctx)
     q = ctx["query"]
-    date = q.get("date") or _today()
+    date = _check_date(q.get("date") or _today())
     params = [date]
     sql = "SELECT * FROM orders WHERE order_date=?"
     if q.get("status"):
@@ -233,24 +320,33 @@ def create_order(ctx):
     user = _require(ctx, "seller", "admin")
     b = ctx["body"]
     raw_items = b.get("items") or []
-    if not raw_items:
+    if not isinstance(raw_items, list) or not raw_items:
         raise ApiError(400, "Add at least one item to the order.")
+    if len(raw_items) > 50:
+        raise ApiError(400, "Too many lines in one order.")
     payment_mode = b.get("payment_mode")
     if payment_mode not in (None, "cash", "upi", "card"):
         raise ApiError(400, "Invalid payment mode.")
-    note = (b.get("note") or "").strip() or None
+    note = (b.get("note") or "").strip()[:200] or None
 
     # Resolve and snapshot each menu item.
     resolved = []
     subtotal = 0.0
     needs_kitchen = False
     for ri in raw_items:
+        if not isinstance(ri, dict):
+            raise ApiError(400, "Invalid order line.")
         mi = db.query_one(
             "SELECT * FROM menu_items WHERE id=? AND is_active=1", (ri.get("menu_item_id"),)
         )
         if not mi:
             raise ApiError(400, "One of the items is no longer available.")
-        qty = int(ri.get("qty") or 0)
+        try:
+            qty = int(ri.get("qty") or 0)
+        except (TypeError, ValueError):
+            raise ApiError(400, "Quantity must be a whole number.")
+        if qty > 99:
+            raise ApiError(400, "Maximum 99 of an item per order.")
         if qty <= 0:
             continue
         line_total = round(mi["price"] * qty, 2)
@@ -304,6 +400,10 @@ def create_order(ctx):
                     "UPDATE menu_items SET stock = stock - ? WHERE id=? AND stock IS NOT NULL",
                     (qty, mi["id"]),
                 )
+            conn.execute(
+                "INSERT INTO order_log (order_id, action, by_name, at) VALUES (?,?,?,?)",
+                (oid, "created", user["name"], now),
+            )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -362,6 +462,10 @@ def update_status(ctx):
                             (it["qty"], it["menu_item_id"]),
                         )
                         restock_ids.append(it["menu_item_id"])
+            conn.execute(
+                "INSERT INTO order_log (order_id, action, by_name, at) VALUES (?,?,?,?)",
+                (oid, new_status, user["name"], _now()),
+            )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -420,8 +524,8 @@ def create_user(ctx):
         raise ApiError(400, "Name and username are required.")
     if role not in ("admin", "kitchen", "seller"):
         raise ApiError(400, "Role must be admin, kitchen or seller.")
-    if len(password) < 4:
-        raise ApiError(400, "Password must be at least 4 characters.")
+    if len(password) < 6:
+        raise ApiError(400, "Password must be at least 6 characters.")
     if db.query_one("SELECT id FROM users WHERE username=?", (username,)):
         raise ApiError(409, "That username is already taken.")
     uid = db.execute(
@@ -452,10 +556,14 @@ def update_user(ctx):
     db.execute("UPDATE users SET name=?, role=?, is_active=? WHERE id=?",
                (name, role, is_active, uid))
     if b.get("password"):
-        if len(b["password"]) < 4:
-            raise ApiError(400, "Password must be at least 4 characters.")
-        db.execute("UPDATE users SET password_hash=? WHERE id=?",
-                   (auth.hash_password(b["password"]), uid))
+        if len(b["password"]) < 6:
+            raise ApiError(400, "Password must be at least 6 characters.")
+        # Bumping token_epoch immediately logs out every device that still
+        # holds a token issued before the reset.
+        db.execute(
+            "UPDATE users SET password_hash=?, token_epoch=COALESCE(token_epoch,0)+1 WHERE id=?",
+            (auth.hash_password(b["password"]), uid),
+        )
     row = db.query_one(
         "SELECT id, name, username, role, is_active, created_at FROM users WHERE id=?", (uid,)
     )
@@ -475,9 +583,45 @@ def delete_user(ctx):
 
 # ---- reports ---------------------------------------------------------------
 
+class RawResponse:
+    """Non-JSON response (e.g. a CSV download)."""
+    def __init__(self, body, content_type, headers=None):
+        self.body = body
+        self.content_type = content_type
+        self.headers = headers or {}
+
+
+def report_export(ctx):
+    """Day's orders as CSV — opens in Excel/Sheets for bookkeeping."""
+    _require(ctx, "admin")
+    date = _check_date(ctx["query"].get("date") or _today())
+    orders = db.query("SELECT * FROM orders WHERE order_date=? ORDER BY id", (date,))
+
+    def cell(v):
+        s = str(v if v is not None else "")
+        if s[:1] in ("=", "+", "-", "@"):  # neutralise spreadsheet formula injection
+            s = "'" + s
+        if any(c in s for c in ',"\n'):
+            s = '"' + s.replace('"', '""') + '"'
+        return s
+
+    lines = ["date,token,time,status,payment,order_total,item,qty,unit_price,line_total,taken_by"]
+    for o in orders:
+        for it in db.query("SELECT * FROM order_items WHERE order_id=? ORDER BY id", (o["id"],)):
+            lines.append(",".join(cell(x) for x in [
+                o["order_date"], o["token_number"], o["created_at"][11:16], o["status"],
+                o["payment_mode"] or "", o["total"], it["name"], it["qty"], it["price"],
+                it["line_total"], o["created_by_name"] or "",
+            ]))
+    body = ("\n".join(lines) + "\n").encode("utf-8-sig")  # BOM so Excel opens it cleanly
+    return RawResponse(body, "text/csv; charset=utf-8", {
+        "Content-Disposition": f'attachment; filename="slurrrp-{date}.csv"',
+    })
+
+
 def report_summary(ctx):
     _require(ctx, "admin")
-    date = ctx["query"].get("date") or _today()
+    date = _check_date(ctx["query"].get("date") or _today())
     counted = "status != 'cancelled'"
     total_row = db.query_one(
         f"SELECT COUNT(*) c, COALESCE(SUM(total),0) g FROM orders"

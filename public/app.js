@@ -24,7 +24,17 @@
     es: null,
     audio: null,
     loginRole: "seller",
+    viewDate: null,      // admin: which business day is shown (null = today)
+    datedOrders: null,   // admin: orders snapshot when viewing a past day
   };
+
+  function todayStr() {
+    var d = new Date();
+    return d.getFullYear() + "-" +
+      String(d.getMonth() + 1).padStart(2, "0") + "-" +
+      String(d.getDate()).padStart(2, "0");
+  }
+  function viewingToday() { return !S.viewDate || S.viewDate === todayStr(); }
 
   /* ---------------- helpers ---------------- */
   function money(n) {
@@ -165,24 +175,69 @@
     return Promise.all(jobs).catch(function () {});
   }
   function loadReport() {
-    return api("/reports/summary").then(function (d) { S.report = d; }).catch(function () {});
+    var qs = viewingToday() ? "" : "?date=" + S.viewDate;
+    return api("/reports/summary" + qs).then(function (d) { S.report = d; }).catch(function () {});
+  }
+  function setViewDate(d) {
+    S.viewDate = d;
+    if (viewingToday()) {
+      S.datedOrders = null;
+      Promise.all([loadReport(), reloadOrders().catch(function () {})]).then(render);
+    } else {
+      Promise.all([
+        loadReport(),
+        api("/orders?date=" + d).then(function (x) { S.datedOrders = x.orders; }).catch(function () { S.datedOrders = []; }),
+      ]).then(render);
+    }
+    render();
+  }
+  function exportCsv() {
+    var date = viewingToday() ? todayStr() : S.viewDate;
+    fetch("/api/reports/export?date=" + date, { headers: { Authorization: "Bearer " + S.token } })
+      .then(function (r) { if (!r.ok) throw new Error("Export failed"); return r.blob(); })
+      .then(function (b) {
+        var a = document.createElement("a");
+        a.href = URL.createObjectURL(b);
+        a.download = "slurrrp-" + date + ".csv";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
+        toast("Downloaded " + a.download + " — opens in Excel", "ok");
+      })
+      .catch(function (e) { toast(e.message, "err"); });
   }
   function reloadOrders() {
     return api("/orders").then(function (d) { S.orders = d.orders; });
   }
 
   /* ---------------- live events ---------------- */
+  // The stream is opened with a one-time 60s ticket instead of the login token,
+  // so the token never appears in a URL (URLs end up in server logs).
   function connectEvents() {
-    if (S.es) S.es.close();
-    var es = new EventSource("/api/events?token=" + encodeURIComponent(S.token));
-    S.es = es;
-    es.onopen = function () { S.connected = true; updateConnDot(); };
-    es.onerror = function () { S.connected = false; updateConnDot(); };
-    es.onmessage = function (ev) {
-      var msg;
-      try { msg = JSON.parse(ev.data); } catch (e) { return; }
-      handleEvent(msg.event, msg.data);
-    };
+    if (S.es) { S.es.close(); S.es = null; }
+    if (!S.token) return;
+    api("/events/ticket", { method: "POST" }).then(function (d) {
+      if (!S.token) return;
+      var es = new EventSource("/api/events?ticket=" + encodeURIComponent(d.ticket));
+      S.es = es;
+      es.onopen = function () { S.connected = true; updateConnDot(); };
+      es.onerror = function () {
+        S.connected = false; updateConnDot();
+        es.close();
+        if (S.es === es) {           // reconnect with a fresh ticket
+          S.es = null;
+          setTimeout(function () { if (S.token) connectEvents(); }, 3000);
+        }
+      };
+      es.onmessage = function (ev) {
+        var msg;
+        try { msg = JSON.parse(ev.data); } catch (e) { return; }
+        handleEvent(msg.event, msg.data);
+      };
+    }).catch(function () {
+      setTimeout(function () { if (S.token) connectEvents(); }, 5000);
+    });
   }
 
   function upsertOrder(o) {
@@ -484,9 +539,34 @@
   /* ---------- orders list (seller / kitchen all / admin) ---------- */
   function renderOrders(kitchenScope, admin) {
     var title = admin ? "All Orders" : (kitchenScope ? "All Orders" : "My Orders");
-    var list = S.orders.slice();
-    if (!list.length) return viewTitle(title, "Today") + emptyState("🧾", "No orders yet", "Orders placed at the cart show up here.");
-    return viewTitle(title, "Today · " + list.length + " orders") +
+    var isToday = !admin || viewingToday();
+    var list = isToday ? S.orders.slice() : (S.datedOrders || []).slice();
+    var dayLabel = isToday ? "Today" : S.viewDate;
+
+    var dateCtl = admin
+      ? '<div class="row" style="gap:8px;margin-bottom:12px"><input type="date" id="ord-date" class="date-ctl" value="' +
+        (isToday ? todayStr() : S.viewDate) + '" max="' + todayStr() + '">' +
+        '<button class="btn btn-sm btn-outline" data-act="export-csv">⬇ Excel</button></div>'
+      : "";
+
+    // Seller handover line: what the seller should have in hand right now.
+    var summary = "";
+    if (S.user.role === "seller" && list.length) {
+      var tot = { cash: 0, upi: 0, card: 0, all: 0 };
+      list.forEach(function (o) {
+        if (o.status === "cancelled") return;
+        tot.all += o.total;
+        if (o.payment_mode) tot[o.payment_mode] += o.total;
+      });
+      summary =
+        '<div class="card" style="border-left:5px solid var(--blue)"><b>Day so far: ' + money(tot.all) + "</b>" +
+        '<div class="small muted" style="margin-top:3px">Cash ' + money(tot.cash) +
+        " · UPI " + money(tot.upi) + " · Card " + money(tot.card) +
+        " — hand over the cash amount at close.</div></div>";
+    }
+
+    if (!list.length) return viewTitle(title, dayLabel) + dateCtl + emptyState("🧾", "No orders", "Orders placed at the cart show up here.");
+    return viewTitle(title, dayLabel + " · " + list.length + " orders") + dateCtl + summary +
       list.map(function (o) { return orderCard(o, admin); }).join("");
   }
 
@@ -507,6 +587,7 @@
       (o.needs_kitchen ? '<div class="small" style="color:#c2410c;font-weight:700;margin:6px 0 2px">🍳 Needs back kitchen</div>' : "") +
       '<div style="margin:8px 0">' + items + "</div>" +
       (o.note ? '<div class="small muted" style="margin-bottom:6px">Note: ' + esc(o.note) + "</div>" : "") +
+      auditLine(o) +
       '<div class="between"><div><b>' + money(o.total) + "</b>" +
       (o.payment_mode ? ' <span class="small muted">· ' + o.payment_mode.toUpperCase() + "</span>" : ' <span class="small muted">· unpaid</span>') +
       " <span class='small muted'>· by " + esc(o.created_by_name || "") + "</span></div>" +
@@ -519,6 +600,20 @@
   function statusPill(s) {
     var label = { new: "New", preparing: "Preparing", ready: "Ready", served: "Served", cancelled: "Cancelled" }[s];
     return '<span class="pill pill-' + s + '">' + label + "</span>";
+  }
+
+  // Audit trail: make it visible WHO voided (or served) an order and when.
+  function auditLine(o) {
+    if (!o.log || !o.log.length) return "";
+    var entry = null;
+    for (var i = o.log.length - 1; i >= 0; i--) {
+      if (o.log[i].action === "cancelled" || o.log[i].action === "served") { entry = o.log[i]; break; }
+    }
+    if (!entry) return "";
+    var verb = entry.action === "cancelled" ? "Voided" : "Served";
+    var color = entry.action === "cancelled" ? "var(--red-dark)" : "var(--muted)";
+    return '<div class="small" style="color:' + color + ';font-weight:600;margin-bottom:6px">' +
+      verb + " by " + esc(entry.by_name || "?") + " · " + timeShort(entry.at) + "</div>";
   }
 
   function orderActions(o, admin) {
@@ -622,9 +717,21 @@
         '<div class="grow">' + esc(t.name) + "</div>" +
         '<div class="small muted">' + t.qty + " sold</div>" +
         '<div style="font-weight:700;min-width:58px;text-align:right">' + money(t.revenue) + "</div></div>";
-    }).join("") || '<div class="muted small">No sales yet today.</div>';
+    }).join("") || '<div class="muted small">No sales for this day.</div>';
+    var isToday = viewingToday();
+    var dateVal = isToday ? todayStr() : S.viewDate;
+    var yday = new Date(Date.now() - 86400000);
+    var ydayStr = yday.getFullYear() + "-" + String(yday.getMonth() + 1).padStart(2, "0") + "-" + String(yday.getDate()).padStart(2, "0");
+    var controls =
+      '<div class="row" style="gap:8px;margin-bottom:12px;flex-wrap:wrap">' +
+      '<button class="chip ' + (isToday ? "active" : "") + '" data-vdate="' + todayStr() + '">Today</button>' +
+      '<button class="chip ' + (S.viewDate === ydayStr ? "active" : "") + '" data-vdate="' + ydayStr + '">Yesterday</button>' +
+      '<input type="date" id="rep-date" class="date-ctl" value="' + dateVal + '" max="' + todayStr() + '">' +
+      '<button class="btn btn-sm btn-outline" data-act="export-csv">⬇ Excel</button>' +
+      "</div>";
     return (
-      viewTitle("Today", new Date().toDateString()) +
+      viewTitle(isToday ? "Today" : dateVal, isToday ? new Date().toDateString() : "Day report") +
+      controls +
       '<div class="kpi-grid">' +
       '<div class="kpi hero"><div class="k-val">' + money(r.gross) + '</div><div class="k-lab">Gross sales today</div></div>' +
       '<div class="kpi"><div class="k-val">' + r.order_count + '</div><div class="k-lab">Orders</div></div>' +
@@ -642,8 +749,7 @@
               '</span><span class="stock-low" style="font-weight:800">' + m.stock + " left</span></div>";
           }).join("") + "</div>"
         : "") +
-      '<div class="cat-head">Live orders</div>' +
-      renderActiveMini() +
+      (isToday ? '<div class="cat-head">Live orders</div>' + renderActiveMini() : "") +
       '<div class="cat-head">Top sellers</div><div class="card">' + top + "</div>"
     );
   }
@@ -714,7 +820,7 @@
       '<div class="field"><label>Name</label><input id="su-name" placeholder="e.g. Priya"></div>' +
       '<div class="row"><div class="field grow"><label>Username</label><input id="su-user" autocapitalize="none" placeholder="priya"></div>' +
       '<div class="field" style="width:130px"><label>Role</label><select id="su-role"><option value="seller">Seller</option><option value="kitchen">Kitchen</option><option value="admin">Admin</option></select></div></div>' +
-      '<div class="field"><label>Password</label><input id="su-pass" placeholder="min 4 characters"></div>' +
+      '<div class="field"><label>Password</label><input id="su-pass" placeholder="min 6 characters"></div>' +
       '<button class="btn btn-primary btn-block" data-act="add-user">Add staff</button></div>';
     var rows = S.users.map(function (u) {
       return '<div class="list-row ' + (u.is_active ? "" : "inactive") + '">' +
@@ -756,6 +862,11 @@
     wireNav();
     // one delegated click handler for the app body
     root.onclick = onClick;
+    // date pickers (admin dashboard / orders)
+    ["#rep-date", "#ord-date"].forEach(function (sel) {
+      var el = root.querySelector(sel);
+      if (el) el.onchange = function () { if (el.value) setViewDate(el.value); };
+    });
     // load lists lazily for admin views
     if (S.view === "staff" && !S._usersLoaded) {
       S._usersLoaded = true;
@@ -776,9 +887,10 @@
   }
 
   function onClick(ev) {
-    var t = ev.target.closest("[data-act],[data-inc],[data-dec],[data-cat],[data-pay],[data-order],[data-nav],[data-edit],[data-del],[data-prep],[data-deluser],[data-resetpw],[data-restock]");
+    var t = ev.target.closest("[data-act],[data-inc],[data-dec],[data-cat],[data-pay],[data-order],[data-nav],[data-edit],[data-del],[data-prep],[data-deluser],[data-resetpw],[data-restock],[data-vdate]");
     if (!t) return;
     var a;
+    if ((a = t.getAttribute("data-vdate"))) return setViewDate(a);
     if ((a = t.getAttribute("data-inc"))) return addToCart(a);
     if ((a = t.getAttribute("data-dec"))) return decCart(a);
     if ((a = t.getAttribute("data-cat"))) { S.cat = a; return render(); }
@@ -814,6 +926,7 @@
     if (act === "save-menu") return saveMenu();
     if (act === "cancel-edit") { S.editItem = null; return render(); }
     if (act === "add-user") return addUser();
+    if (act === "export-csv") return exportCsv();
   }
 
   function syncNote() {
@@ -894,10 +1007,20 @@
       .catch(function (e) { toast(e.message, "err"); });
   }
   function resetPw(id) {
-    var pw = prompt("New password (min 4 characters):");
+    var pw = prompt("New password (min 6 characters):");
     if (!pw) return;
+    if (pw.length < 6) return toast("Password must be at least 6 characters", "err");
+    var isSelf = String(id) === String(S.user.id);
     api("/users/" + id, { method: "PATCH", body: { password: pw } })
-      .then(function () { toast("Password reset", "ok"); })
+      .then(function () {
+        if (isSelf) {
+          // changing your own password logs out all devices, including this one
+          toast("Password changed — please log in again", "ok");
+          setTimeout(doLogout, 1200);
+        } else {
+          toast("Password reset — their devices will ask to log in again", "ok");
+        }
+      })
       .catch(function (e) { toast(e.message, "err"); });
   }
 

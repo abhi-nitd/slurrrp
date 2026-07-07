@@ -166,6 +166,7 @@ input, select, textarea { -webkit-appearance: none; appearance: none; }
 .stepper .q { color: #fff; font-weight: 800; min-width: 22px; text-align: center; font-size: 14px; }
 .stepper button:disabled { opacity: .35; }
 .stock-low { color: var(--red-dark); }
+.date-ctl { padding: 8px 10px; border: 1.5px solid var(--line); border-radius: 10px; background: #fff; font-size: 14px; color: var(--ink); font-family: inherit; }
 .mcard-out { opacity: .55; }
 .soldout-tag { position: absolute; top: 10px; right: 10px; background: #eef0f7; color: var(--muted); font-size: 10px; font-weight: 700; padding: 3px 8px; border-radius: 8px; }
 

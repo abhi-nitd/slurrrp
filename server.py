@@ -42,6 +42,8 @@ mimetypes.add_type("font/woff2", ".woff2")
 ROUTES = [
     ("POST", r"^/api/login$", api.login),
     ("GET", r"^/api/me$", api.me),
+    ("POST", r"^/api/events/ticket$", api.events_ticket),
+    ("GET", r"^/api/reports/export$", api.report_export),
     ("GET", r"^/api/menu$", api.list_menu),
     ("POST", r"^/api/menu$", api.create_menu),
     ("PUT", r"^/api/menu/(?P<id>\d+)$", api.update_menu),
@@ -82,7 +84,8 @@ def _unquote(s):
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "slurrrp/1.0"
+    server_version = "slurrrp"
+    sys_version = ""  # don't advertise the Python version to the world
 
     def log_message(self, fmt, *args):
         sys.stdout.write("%s - %s\n" % (self.address_string(), fmt % args))
@@ -95,6 +98,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
 
     def _json(self, status, obj):
         body = json.dumps(obj).encode("utf-8")
@@ -156,6 +160,14 @@ class Handler(BaseHTTPRequestHandler):
         path, _, query = self.path.partition("?")
         self._dispatch("DELETE", path, parse_qs(query))
 
+    def _client_ip(self):
+        # Take the RIGHTMOST X-Forwarded-For entry: that's the one appended by
+        # our own proxy (Render). The leftmost entries are client-supplied and
+        # trivially spoofable, so they must never feed the rate limiter.
+        xff = self.headers.get("X-Forwarded-For", "")
+        parts = [p.strip() for p in xff.split(",") if p.strip()]
+        return parts[-1] if parts else self.client_address[0]
+
     def _dispatch(self, method, path, query):
         for m, rx, handler in COMPILED:
             if m != method:
@@ -163,19 +175,34 @@ class Handler(BaseHTTPRequestHandler):
             match = rx.match(path)
             if not match:
                 continue
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            if length > 1_000_000:  # cap request bodies at 1 MB
+                self.close_connection = True  # unread body bytes: don't reuse socket
+                return self._json(413, {"error": "Request too large."})
             body = self._read_body() if method in ("POST", "PUT", "PATCH", "DELETE") else {}
-            xff = self.headers.get("X-Forwarded-For", "")
-            ip = xff.split(",")[0].strip() if xff else self.client_address[0]
             ctx = {
                 "user": self._user_from_auth(),
                 "params": match.groupdict(),
                 "query": query,
                 "body": body,
-                "ip": ip,
+                "ip": self._client_ip(),
             }
             try:
                 result = handler(ctx)
-                self._json(200, result)
+                if isinstance(result, api.RawResponse):
+                    self.send_response(200)
+                    self.send_header("Content-Type", result.content_type)
+                    self.send_header("Content-Length", str(len(result.body)))
+                    for k, v in result.headers.items():
+                        self.send_header(k, v)
+                    self._sec_headers()
+                    self.end_headers()
+                    self.wfile.write(result.body)
+                else:
+                    self._json(200, result)
             except api.ApiError as e:
                 self._json(e.status, {"error": e.message})
             except Exception as e:  # pragma: no cover - defensive
@@ -186,10 +213,13 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Server-Sent Events (live order relay) ----
     def _sse(self, query):
-        user = self._user_from_auth(query.get("token"))
+        # Auth via one-time ticket (never the real login token — URLs get logged).
+        user = api.validate_session(api.consume_ticket(query.get("ticket") or ""))
         if not user:
             return self._json(401, {"error": "Please log in."})
         cid, q = events.subscribe(user["role"])
+        if cid is None:
+            return self._json(503, {"error": "Too many live connections."})
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -217,7 +247,7 @@ class Handler(BaseHTTPRequestHandler):
             path = "/index.html"
         rel = path.lstrip("/")
         target = os.path.normpath(os.path.join(PUBLIC_DIR, rel))
-        if not target.startswith(PUBLIC_DIR):
+        if target != PUBLIC_DIR and not target.startswith(PUBLIC_DIR + os.sep):
             return self._json(403, {"error": "Forbidden."})
         if not os.path.isfile(target):
             # SPA fallback: serve the shell for client-side routes

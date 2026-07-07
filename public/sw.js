@@ -1,6 +1,6 @@
 /* slurrrp service worker — app-shell cache + notification click.
    Only registers over HTTPS; API calls always go to the network. */
-var CACHE = "slurrrp-v1";
+var CACHE = "slurrrp-v3";
 var SHELL = ["/", "/index.html", "/styles.css", "/app.js", "/icon.svg", "/manifest.webmanifest"];
 
 self.addEventListener("install", function (e) {
