@@ -55,21 +55,10 @@ input, select, textarea { -webkit-appearance: none; appearance: none; }
   box-shadow: 0 2px 10px rgba(0,0,0,.14);
 }
 .brand { display: flex; }
-/* logo wordmark: red fill + white outline, exactly like the slurrrp mark */
-.wm { display: block; height: auto; overflow: visible; }
-.wm text {
-  font-family: var(--brand-font);
-  font-weight: 600;
-  font-size: 58px;
-  letter-spacing: -1.5px;
-  fill: var(--red);
-  stroke: #fff;
-  stroke-width: 7px;
-  stroke-linejoin: round;
-  paint-order: stroke;
-}
-.wm-hd { width: 118px; }
-.wm-lg { width: 232px; }
+/* logo wordmark: the real slurrrp mark (public/logo.svg) */
+.wm { display: block; height: auto; }
+.wm-hd { width: 104px; }
+.wm-lg { width: 236px; }
 .logo-badge { background: var(--blue); border-radius: 20px; padding: 16px 24px 20px; display: inline-block; box-shadow: 0 8px 22px rgba(27,24,204,.35); }
 .header-sub { font-size: 12px; opacity: .85; margin-top: 1px; }
 .header-spacer { flex: 1; }

@@ -360,8 +360,7 @@
   }
 
   function wordmark(cls) {
-    return '<svg class="wm ' + cls + '" viewBox="0 0 300 78" preserveAspectRatio="xMidYMid meet" role="img" aria-label="slurrrp">' +
-      '<text x="150" y="58" text-anchor="middle">slurrrp</text></svg>';
+    return '<img class="wm ' + cls + '" src="/logo.svg" alt="slurrrp">';
   }
 
   function renderHeader() {
