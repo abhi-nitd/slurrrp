@@ -360,7 +360,7 @@
   }
 
   function wordmark(cls) {
-    return '<img class="wm ' + cls + '" src="/logo.svg" alt="slurrrp">';
+    return '<img class="wm ' + cls + '" src="/logo.png" alt="slurrrp">';
   }
 
   function renderHeader() {

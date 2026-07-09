@@ -1,8 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
-  <!-- slurrrp app icon: the wordmark's "s" letterform on the brand blue tile -->
-  <rect width="512" height="512" rx="112" fill="#1010c8"/>
-  <g transform="translate(256 256) scale(1.15) translate(-187 -297.5)" fill="none" stroke-linecap="round" stroke-linejoin="round">
-    <path stroke="#ffffff" stroke-width="100" d="M272 225 L152 225 Q97 225 97 261 Q97 298 152 298 L222 298 Q277 298 277 334 Q277 370 222 370 L102 370"/>
-    <path stroke="#ee1111" stroke-width="60" d="M272 225 L152 225 Q97 225 97 261 Q97 298 152 298 L222 298 Q277 298 277 334 Q277 370 222 370 L102 370"/>
-  </g>
-</svg>

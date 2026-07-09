@@ -1,13 +1,5 @@
 /* slurrrp — mobile-first PWA styles */
-@font-face {
-  font-family: "Fredoka";
-  font-style: normal;
-  font-weight: 300 700;
-  font-display: swap;
-  src: url("/fonts/fredoka.woff2") format("woff2");
-}
 :root {
-  --brand-font: "Fredoka", "Segoe UI Rounded", "SF Pro Rounded", system-ui, sans-serif;
   --blue: #1b18cc;
   --blue-dark: #14118f;
   --blue-tint: #eceafc;
